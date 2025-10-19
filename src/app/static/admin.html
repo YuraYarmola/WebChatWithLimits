@@ -1,0 +1,279 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Priority Streams Chat — Admin</title>
+  <style>
+    body { font-family: system-ui, Arial; margin: 0; padding: 16px; background:#0b0b0c; color:#e7e7e8;}
+    h2,h3 { margin: 8px 0 12px; }
+    .card { border:1px solid #2a2a2e; border-radius:12px; padding:12px; margin-bottom:16px; background:#0f0f12; }
+    label { display:inline-block; margin-right:10px; }
+    input, button, select { padding:8px; border-radius:8px; border:1px solid #333; background:#151518; color:#eee; }
+    button { cursor:pointer; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { padding: 8px; border-bottom: 1px solid #2a2a2e; text-align:left; vertical-align: top;}
+    .row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px; }
+    a { color:#9ab; }
+    .muted { color:#9aa0a6; font-size:12px; }
+    .pill { display:inline-block; padding:2px 6px; border-radius:999px; background:#1b1b1f; border:1px solid #2c2c30; color:#bdbdc2; margin-left:6px; font-size:12px;}
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+    .right { text-align:right }
+    .error { color:#ffadad; }
+  </style>
+</head>
+<body>
+  <h2>Admin Panel</h2>
+  <div style="margin-bottom:10px;"><a href="/">← Back to Client</a></div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Users</h3>
+      <div class="row">
+        <label>ID <input id="u_id" type="number" style="width:110px" placeholder="(auto)"></label>
+        <label>Name <input id="u_name" placeholder="Display name"></label>
+        <label>Email <input id="u_email" placeholder="email@domain"></label>
+        <button onclick="createUser()">Add user</button>
+        <button onclick="loadUsers()">Reload</button>
+      </div>
+      <table id="usersTbl">
+        <thead><tr><th>ID</th><th>Name</th><th>Email</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Channels</h3>
+      <div class="row">
+        <input id="newChannelName" placeholder="Channel name" />
+        <label><input id="newChannelGroup" type="checkbox" checked> group</label>
+        <button onclick="createChannel()">Create channel</button>
+        <button onclick="loadAll()">Reload all</button>
+      </div>
+      <table id="channelsTbl">
+        <thead><tr><th>ID</th><th>Name</th><th>Participants</th><th>Streams</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Autosave</h3>
+    <div class="row">
+      <label><input id="autosave" type="checkbox" checked> Save policy automatically (0.5s debounce)</label>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Details</h3>
+    <div id="details"></div>
+  </div>
+
+<script>
+const $ = (q, root=document) => root.querySelector(q);
+function h(el, attrs={}, html=null){
+  const e = document.createElement(el);
+  for (const [k,v] of Object.entries(attrs)) {
+    if (k === 'class') e.className = v;
+    else if (k === 'text') e.textContent = v;
+    else e.setAttribute(k, v);
+  }
+  if (html !== null) e.innerHTML = html;
+  return e;
+}
+
+/* ------------ Fetch helper ------------ */
+async function api(url, opts={}){
+  const res = await fetch(url, opts);
+  if (!res.ok) throw new Error(`${opts.method||'GET'} ${url} -> ${res.status}`);
+  return res.json();
+}
+
+/* ------------ Users ------------ */
+async function loadUsers(){
+  const users = await api('/admin/users');
+  const tb = $('#usersTbl tbody'); tb.innerHTML = '';
+  for (const u of users){
+    const tr = h('tr');
+    tr.innerHTML = `<td>${u.id}</td><td>${u.display_name||''}</td><td>${u.email||''}</td>`;
+    tb.appendChild(tr);
+  }
+}
+
+async function createUser(){
+  const id = $('#u_id').value ? Number($('#u_id').value) : null;
+  const name = $('#u_name').value || null;
+  const email = $('#u_email').value || null;
+
+  const params = new URLSearchParams();
+  if (id !== null) params.append('id', String(id));
+  if (name) params.append('display_name', name);
+  if (email) params.append('email', email);
+
+  const res = await fetch('/admin/users?'+params.toString(), { method:'POST' });
+  if (!res.ok) { alert('Create user failed'); return; }
+  $('#u_id').value=''; $('#u_name').value=''; $('#u_email').value='';
+  await Promise.all([loadUsers(), loadAll()]);
+}
+
+/* ------------ Channels, Participants, Streams ------------ */
+async function loadAll(){
+  // 1) канали
+  let channels = [];
+  try {
+    channels = await api('/admin/channels');
+  } catch (e) {
+    const tb = $('#channelsTbl tbody');
+    tb.innerHTML = `<tr><td colspan="4" class="error">Failed to load channels: ${e.message}</td></tr>`;
+    return;
+  }
+
+  // 2) рендер початкових рядків
+  const tb = $('#channelsTbl tbody'); tb.innerHTML = '';
+  for (const c of channels){
+    const tr = h('tr');
+    tr.innerHTML = `
+      <td>${c.id}</td>
+      <td>${c.name}</td>
+      <td id="c-${c.id}-p">loading...</td>
+      <td id="c-${c.id}-s">loading...</td>
+    `;
+    tb.appendChild(tr);
+  }
+
+  // 3) підвантажуємо дані для кожного каналу
+  await Promise.all(channels.map(async (c)=>{
+    // participants
+    try {
+      const parts = await api(`/admin/channels/${c.id}/participants`);
+      const pDiv = $(`#c-${c.id}-p`);
+      const pWrap = h('div');
+      const pList = h('div');
+      pList.innerHTML = parts.length
+        ? parts.map(p=>`<div>#${p.id}: u${p.user_id} <span class="pill">${p.role}</span></div>`).join('')
+        : '<div class="muted">no participants</div>';
+      const pForm = h('div', {class:'row'});
+      pForm.innerHTML = `
+        <label>Add user <input type="number" id="add_u_${c.id}" style="width:120px" placeholder="user id"></label>
+        <button id="add_btn_${c.id}">Add</button>
+      `;
+      pWrap.appendChild(pList); pWrap.appendChild(pForm);
+      pDiv.innerHTML = ''; pDiv.appendChild(pWrap);
+
+      pForm.querySelector(`#add_btn_${c.id}`).onclick = async ()=>{
+        const uid = Number(pForm.querySelector(`#add_u_${c.id}`).value);
+        if (!uid) return alert('Enter user id');
+        const url = `/admin/channels/${c.id}/participants?user_id=${encodeURIComponent(uid)}&role=member`;
+        const r = await fetch(url, {method:'POST'});
+        if (!r.ok){ alert('Failed'); return; }
+        await loadAll();
+      };
+    } catch (e) {
+      const pDiv = $(`#c-${c.id}-p`);
+      pDiv.innerHTML = `<span class="error">failed: ${e.message}</span>`;
+    }
+
+    // streams
+    // streams
+const sDiv = $(`#c-${c.id}-s`);
+try {
+  // гарантуємо, що у кожного учасника є Stream
+  await fetch(`/admin/channels/${c.id}/ensure_streams`, { method: 'POST' });
+
+  const streams = await api(`/admin/streams/${c.id}`);
+  const sTable = h('table'); sTable.style.width='100%';
+  const thead = h('thead'); thead.innerHTML = `
+    <tr><th>Stream ID</th><th>Owner User</th><th>msg_rps</th><th>upload_bps</th><th>download_bps</th><th>burst</th><th>enabled</th><th class="right">Action</th></tr>`;
+  const tbody = h('tbody');
+  sTable.appendChild(thead); sTable.appendChild(tbody);
+
+  for (const s of streams){
+    const p = s.policy || {};
+    const msg_rps  = p.msg_rate_rps  ?? 5;
+    const up_bps   = p.upload_bps    ?? 262144;
+    const down_bps = p.download_bps  ?? 524288;
+    const burst    = p.burst         ?? 10;
+    const enabled  = p.enabled       ?? false;
+
+    const row = h('tr');
+    row.innerHTML = `
+      <td>${s.id}</td>
+      <td>u${s.owner_user_id}</td>
+      <td><input type="number" id="rps_${s.id}"   value="${msg_rps}"  min="0" style="width:120px"></td>
+      <td><input type="number" id="up_${s.id}"    value="${up_bps}"   min="0" style="width:160px"></td>
+      <td><input type="number" id="down_${s.id}"  value="${down_bps}" min="0" style="width:160px"></td>
+      <td><input type="number" id="burst_${s.id}" value="${burst}"    min="0" style="width:120px"></td>
+      <td><input type="checkbox" id="en_${s.id}" ${enabled ? 'checked':''}></td>
+      <td class="right"><button id="save_${s.id}">Save</button></td>
+    `;
+
+    // Прив’язки всередині row (працює на 100%)
+    const rpsEl   = row.querySelector(`#rps_${s.id}`);
+    const upEl    = row.querySelector(`#up_${s.id}`);
+    const downEl  = row.querySelector(`#down_${s.id}`);
+    const burstEl = row.querySelector(`#burst_${s.id}`);
+    const enEl    = row.querySelector(`#en_${s.id}`);
+    const saveBtn = row.querySelector(`#save_${s.id}`);
+
+    const save = async ()=>{
+      if (!rpsEl || !upEl || !downEl || !burstEl || !enEl) return;
+      const body = {
+        msg_rate_rps: parseInt(rpsEl.value || '0', 10),
+        upload_bps:   parseInt(upEl.value  || '0', 10),
+        download_bps: parseInt(downEl.value|| '0', 10),
+        burst:        parseInt(burstEl.value||'0', 10),
+        enabled:      !!enEl.checked
+      };
+      const res = await fetch('/admin/streams/'+s.id+'/policy', {
+        method: 'PUT',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) { alert('Save failed'); }
+    };
+
+    if (saveBtn) saveBtn.addEventListener('click', save);
+
+    // autosave (debounce)
+    let t = null;
+    [rpsEl, upEl, downEl, burstEl, enEl].forEach(inp=>{
+      if (!inp) return;
+      inp.addEventListener(inp.type === 'checkbox' ? 'change' : 'input', ()=>{
+        if (!$('#autosave').checked) return;
+        clearTimeout(t);
+        t = setTimeout(save, 500);
+      });
+    });
+
+    tbody.appendChild(row);
+  }
+
+  sDiv.innerHTML = ''; sDiv.appendChild(sTable);
+  if (!streams.length) {
+    sDiv.innerHTML = '<span class="muted">no streams (will appear after ensure)</span>';
+  }
+} catch (e) {
+  sDiv.innerHTML = `<span class="error">failed: ${e.message}</span>`;
+}
+
+  }));
+}
+
+async function createChannel(){
+  const name = $('#newChannelName').value.trim();
+  const isGroup = $('#newChannelGroup').checked;
+  if (!name) return alert('Enter channel name');
+  const body = JSON.stringify({name, is_group: isGroup});
+  const res = await fetch('/admin/channels', {method:'POST', headers:{'Content-Type':'application/json'}, body});
+  if (!res.ok){ alert('Failed'); return; }
+  $('#newChannelName').value='';
+  await loadAll();
+}
+
+/* -------- init -------- */
+(async function init(){
+  await Promise.all([loadUsers(), loadAll()]);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,274 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Priority Streams Chat — Client</title>
+  <style>
+    body { font-family: system-ui, Arial; margin: 0; padding: 16px; background:#0b0b0c; color:#e7e7e8;}
+    .row { display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap;}
+    input, button, select { padding:8px; border-radius:8px; border:1px solid #333; background:#151518; color:#eee; }
+    button { cursor:pointer; }
+    #log { border:1px solid #333; border-radius:12px; padding:12px; height:55vh; overflow:auto; background:#0f0f12;}
+    .msg { margin:6px 0; }
+    .sys { color:#9aa0a6; font-style:italic; }
+    .me  { color:#b4f1b4; }
+    .other { color:#c7d2fe; }
+    .badge { background:#222; border:1px solid #333; border-radius:6px; padding:2px 6px; margin-left:6px; color:#aaa;}
+    .pill  { display:inline-block; padding:2px 6px; border-radius:999px; background:#1b1b1f; border:1px solid #2c2c30; color:#bdbdc2; margin-left:6px; font-size:12px;}
+    a { color:#9ab; }
+  </style>
+</head>
+<body>
+  <h2>Priority Streams Chat — Client</h2>
+
+  <div class="row">
+    <label>User ID <input id="uid" type="number" value="1" min="1" style="width:100px"/></label>
+    <label>Channel ID <input id="cid" type="number" value="1" min="1" style="width:100px"/></label>
+    <button id="connect">Connect</button>
+    <button id="disconnect" disabled>Disconnect</button>
+    <span id="status" class="badge">disconnected</span>
+    <a href="/admin-ui" style="margin-left:auto;">Admin Panel →</a>
+  </div>
+
+  <div id="log"></div>
+
+  <div class="row">
+    <input id="text" placeholder="Type a message..." style="flex:1"/>
+    <button id="send" disabled>Send</button>
+  </div>
+
+  <div class="row">
+    <input id="fileInput" type="file"/>
+    <button id="uploadBtn" disabled>Upload</button>
+
+    <label style="margin-left:16px;">Attachment ID
+      <input id="dl_id" type="number" min="1" style="width:140px"/>
+    </label>
+    <button id="downloadBtn" disabled>Download</button>
+  </div>
+
+<script>
+let ws = null;
+let userId = null;
+let channelId = null;
+
+/* тимчасові значення, поки не отримаємо message_id */
+let pendingUploadBadge = null;
+let pendingUploadTotal = 0;
+let serverUploadProgress = false;
+
+/* постійні прив’язки: message_id -> DOM елемент та total */
+const uploadBadges = new Map(); // messageId -> HTMLElement
+const uploadTotals = new Map();  // messageId -> number
+
+const $ = (id)=>document.getElementById(id);
+
+const log = (html, cls="sys") => {
+  const div = document.createElement('div');
+  div.className = "msg " + cls;
+  div.innerHTML = html;
+  $('log').appendChild(div);
+  $('log').scrollTop = $('log').scrollHeight;
+  return div;
+};
+
+function setConnected(state) {
+  $('connect').disabled = state;
+  $('disconnect').disabled = !state;
+  $('send').disabled = !state;
+  $('uploadBtn').disabled = !state;
+  $('downloadBtn').disabled = !state;
+  $('status').textContent = state ? "connected" : "disconnected";
+}
+
+function fmtBps(bps){
+  if (!bps && bps !== 0) return "";
+  if (bps >= 1024*1024) return (bps/1024/1024).toFixed(2) + " MB/s";
+  if (bps >= 1024) return (bps/1024).toFixed(1) + " KB/s";
+  return Math.round(bps) + " B/s";
+}
+
+$('connect').onclick = () => {
+  userId   = parseInt($('uid').value, 10);
+  channelId= parseInt($('cid').value, 10);
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${proto}://${location.host}/ws?user_id=${userId}`;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    setConnected(true);
+    log("WS open","sys");
+    ws.send(JSON.stringify({action:"join_channel", channel_id: channelId}));
+  };
+
+  ws.onmessage = (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+
+      if (data.type === "joined") {
+        log(`Joined channel ${data.channel_id}`,"sys");
+      }
+      else if (data.type === "message.new") {
+        const m = data.message;
+        const cls = (m.sender_id === userId) ? "me" : "other";
+
+        if (m.meta && m.meta.kind === "file") {
+          const attId = m.meta.attachment_id;
+          const name  = m.meta.file_name ?? "file";
+          const size  = typeof m.meta.size === "number" ? ` (${(m.meta.size/1024/1024).toFixed(2)} MB)` : "";
+          const rowId = `file-${attId}`;
+          const href = `/files/${attId}/download?user_id=${encodeURIComponent(userId)}`;
+          log(
+            `<div id="${rowId}">
+               <b>#${m.channel_id}</b> [u${m.sender_id}] → 📎 ${name}${size}
+               <a href="${href}" download>Download</a>
+             </div>`,
+            cls
+          );
+        } else {
+          log(`<b>#${m.channel_id}</b> [u${m.sender_id}] → ${m.content ?? ""}`, cls);
+        }
+      }
+      else if (data.type === "file.upload.progress") {
+        // 1) знаходимо елемент для цього message_id
+        let el = uploadBadges.get(data.message_id)
+              || document.getElementById(`file-up-${data.message_id}-p`)
+              || pendingUploadBadge;
+
+        // 2) якщо це перший івент для цього message_id — закріплюємо бейдж і total у мапах
+        if (!uploadBadges.has(data.message_id) && el) {
+          uploadBadges.set(data.message_id, el);
+          // закріпимо total (якщо від фронта був відомий)
+          if (pendingUploadBadge === el && pendingUploadTotal) {
+            uploadTotals.set(data.message_id, pendingUploadTotal);
+          }
+          // зробимо стабільний id (зручно і для DevTools)
+          if (!el.id || !el.id.includes(`file-up-${data.message_id}-p`)) {
+            el.id = `file-up-${data.message_id}-p`;
+          }
+          // очищаємо тимчасовий вказівник лише якщо він співпав
+          if (pendingUploadBadge === el) pendingUploadBadge = null;
+          serverUploadProgress = true;
+        }
+
+        // 3) обрахунок і рендер
+        const total = (typeof data.total === 'number' ? data.total
+                       : (uploadTotals.get(data.message_id) || 0));
+        if (el) {
+          const pct = total ? Math.min(100, (data.bytes / total) * 100) : 0;
+          const bps = data.bps || 0;
+          let eta = '';
+          if (total && bps > 0) {
+            const remain = Math.max(0, total - data.bytes);
+            eta = ` • ETA ${(remain / bps).toFixed(1)}s`;
+          }
+          el.textContent = `${total ? pct.toFixed(0) + '% • ' : ''}${fmtBps(bps)}${eta}`;
+        }
+      }
+      else if (data.type === "throttled") {
+        log(`Throttled: ${data.reason}`,"sys");
+      }
+      else if (data.type === "error") {
+        log(`Error: ${data.error}`,"sys");
+      }
+      else {
+        log(`Event: ${ev.data}`,"sys");
+      }
+    } catch (e) {
+      log(`Raw: ${ev.data}`,"sys");
+    }
+  };
+
+  ws.onclose = () => { setConnected(false); log("WS closed","sys"); };
+  ws.onerror = () => { log("WS error","sys"); };
+};
+
+$('disconnect').onclick = () => { if (ws) ws.close(); };
+
+$('send').onclick = () => {
+  const t = $('text');
+  const text = t.value.trim();
+  if (!text) return;
+  ws.send(JSON.stringify({action:"send_message", payload:{channel_id: channelId, content: text}}));
+  t.value = "";
+};
+$('text').addEventListener('keydown', (e)=>{
+  if (e.key === 'Enter' && !e.shiftKey) $('send').click();
+});
+
+/* ---------- Upload with client-side progress (XHR) ---------- */
+async function uploadViaXHR(file){
+  return new Promise((resolve, reject)=>{
+    const xhr = new XMLHttpRequest();
+    const url = `/files/upload_raw?channel_id=${encodeURIComponent(channelId)}&user_id=${encodeURIComponent(userId)}&filename=${encodeURIComponent(file.name)}&size=${file.size}&content_type=${encodeURIComponent(file.type||"application/octet-stream")}`;
+
+    serverUploadProgress = false;
+
+    const rowId = `file-up-${Date.now()}`;
+    log(`<div id="${rowId}">Uploading 📎 ${file.name} (${(file.size/1024/1024).toFixed(2)} MB)
+          <span class="pill" id="${rowId}-p"></span></div>`, "me");
+    pendingUploadBadge = document.getElementById(`${rowId}-p`);
+    pendingUploadTotal = file.size;
+
+    let lastTime = Date.now();
+    let lastLoaded = 0;
+
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      if (serverUploadProgress) return;
+
+      const loaded = e.loaded;
+      const total  = e.total;
+
+      const now = Date.now();
+      const dt = (now - lastTime) / 1000;
+      const db = loaded - lastLoaded;
+      const bps = db / Math.max(0.001, dt);
+
+      const el = document.getElementById(`${rowId}-p`);
+      if (el) {
+        let pct = total ? (loaded / total * 100) : 0;
+        pct = Math.min(99, pct);
+        el.textContent = `${pct ? pct.toFixed(0) + '% • ' : ''}${fmtBps(bps)}`;
+      }
+
+      lastTime = now;
+      lastLoaded = loaded;
+    };
+
+    xhr.onload = ()=>{
+      try {
+        const resp = JSON.parse(xhr.responseText);
+        const el = document.getElementById(`${rowId}-p`);
+        if (el) el.textContent = `done`;
+        resolve(resp);
+      } catch(e){ reject(e); }
+    };
+    xhr.onerror = ()=> reject(new Error("upload failed"));
+    xhr.open("PUT", url);
+    xhr.send(file);
+  });
+}
+
+$('uploadBtn').onclick = async () => {
+  const input = $('fileInput');
+  if (!input.files || !input.files[0]) return alert("Choose a file first");
+  try {
+    await uploadViaXHR(input.files[0]);
+    input.value = "";
+  } catch(e) {
+    log(String(e),"sys");
+    alert(String(e));
+  }
+};
+
+$('downloadBtn').onclick = () => {
+  const id = $('dl_id').value.trim();
+  if (!id) return alert("Enter attachment id");
+  const url = `/files/${encodeURIComponent(id)}/download?user_id=${encodeURIComponent(userId)}`;
+  window.open(url, '_blank');
+};
+</script>
+</body>
+</html>
